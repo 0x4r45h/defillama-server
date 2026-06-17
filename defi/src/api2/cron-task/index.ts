@@ -16,8 +16,7 @@ import * as sdk from '@defillama/sdk'
 import { RUN_TYPE, runWithRuntimeLogging } from "../utils";
 import { genFormattedChains } from "./genFormattedChains";
 import { fetchRWAStats } from "../../rwa";
-import { getDALayersInternal } from "../../getDALayers";
-// import { getTwitterOverviewFileV2 } from "../../../dev-metrics/utils/r2";
+import { getDALayersInternal } from "../routes/getDALayers";
 import { sendMessage } from "../../utils/discord";
 import { extraSections, chainKeyToLabelMap } from "../../utils/normalizeChain";
 import { dailyTvl, hourlyTvl, hourlyUsdTokensTvl } from "../../utils/getLastRecord";
