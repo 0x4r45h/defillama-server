@@ -2,6 +2,7 @@ import { queryPostgresWithRetry } from "../../src/utils/shared/bridgedTvlPostgre
 import { getPgConnection } from "../utils/shared/getDBConnection";
 import { sendMessage } from "../utils/discord";
 import { searchWidth } from "../utils/shared/constants";
+import { humanizeNumber } from "@defillama/sdk";
 
 type ChangedAdapter = { to: string; from: string; change: number; key: string };
 
@@ -21,7 +22,7 @@ export const columns = ["latency", "usd_amount", "symbol", "percentage", "key", 
 
 export function addStaleCoin(staleCoins: any, data: StaleCoinData) {
   if (!data.key) return;
-  if (data.key in staleCoins && staleCoins[data.key].usdAmount > data.usd_amount) return;
+  if (data.key in staleCoins && staleCoins[data.key].usd_amount > data.usd_amount) return;
   staleCoins[data.key] = data;
 }
 
@@ -109,15 +110,17 @@ export async function notifyStaleCoins() {
   const timeout: number = searchWidth / 3600;
   let message: string = "";
   let teamMessage: string = "";
-  stored.map((d: StaleCoinData) => {
-    let readableTvl: string = d.usd_amount > 1e6 ? `${d.usd_amount / 1e6}M` : `${d.usd_amount / 1e3}k`;
-    message += `\nIn ${timeout - d.latency}h a ${d.protocol} TVL chart will lose ${readableTvl}$ (${
-      d.percentage
-    }%) because ${d.key} is ${d.latency}h stale`;
-    if (d.usd_amount > 1e8 && timeout - d.latency < 7) {
-      teamMessage += `\nIn ${timeout - d.latency}h a ${d.protocol} TVL chart will lose ${readableTvl}$ (${
-        d.percentage
-      }%) because ${d.key} is ${d.latency}h stale`;
+  stored.forEach((d: StaleCoinData) => {
+    if (d.usd_amount > 1e11) {
+      console.log(`Skipping ${d.key} (${d.symbol}) with TVL ${d.usd_amount} - too large for stale coin alert`);
+      return; // ignore 100B+ coins
+    }
+    let readableTvl: string = humanizeNumber(d.usd_amount);
+    message += `\nIn ${timeout - d.latency}h a ${d.protocol} TVL chart will lose ${readableTvl}$ (${d.percentage
+      }%) because ${d.key} (${d.symbol}) is ${d.latency}h stale`;
+    if (d.usd_amount > 1e8 && timeout - d.latency < 13) {
+      teamMessage += `\nIn ${timeout - d.latency}h a ${d.protocol} TVL chart will lose ${readableTvl}$ (${d.percentage
+        }%) because ${d.key} (${d.symbol}) is ${d.latency}h stale`;
     }
   });
 
@@ -147,3 +150,15 @@ export async function notifyChangedAdapter() {
   if (message.length) promises.push(sendMessage(message, process.env.STALE_COINS_ADAPTERS_WEBHOOK!, true));
   await Promise.all(promises);
 }
+
+
+async function run() {
+  await notifyStaleCoins();
+  await notifyChangedAdapter();
+}
+
+if (process.env.RUN_SCRIPT_MODE)
+  run().catch(console.error).then(() => {
+    console.log("Done");
+    process.exit(0);
+  });

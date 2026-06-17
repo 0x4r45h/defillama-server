@@ -3,9 +3,39 @@ import { getCurrentUnixTimestamp } from "./utils/date";
 import { sendMessage } from "./utils/discord";
 import { wrap, IResponse, successResponse, errorResponse } from "./utils/shared";
 import { sluggifyString } from "./utils/sluggify";
-import fetch from "node-fetch";
 
 // CREATE TABLE errorReports (time INT, protocol VARCHAR(200), dataType VARCHAR(200), message TEXT, correctSource TEXT, contact TEXT, id serial primary key);
+
+const FRONT_FORM_URL =
+  "https://webhook.frontapp.com/forms/0f7e04ca1380d461a597/LKbySkFsuoKOT3u3tAzk45SYm8cWIPVJb2zipokH6m-bzllqmtpfU_X7vmTO4rSaEzyqaVIB04K-TMAmXLFd7SDvKyDyUm1-zkjkycK6KPhEe4fZaa9q2KK95l-Ju8A";
+const FRONT_FORM_TIMEOUT_MS = 5_000;
+
+async function submitFrontReport(formData: FormData, protocol: string, dataType: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FRONT_FORM_TIMEOUT_MS);
+
+  try {
+    const frontResponse = await fetch(FRONT_FORM_URL, {
+      method: 'POST',
+      headers: {
+        Referer: 'https://defillama.com/error',
+        Origin: 'https://defillama.com',
+      },
+      body: formData,
+      signal: controller.signal,
+    });
+
+    if (frontResponse.url !== "https://defillama.com/error?code=ok") {
+      console.log(
+        `Failed to send a front message for ${protocol} (${dataType}): ${frontResponse.status} ${frontResponse.url}`
+      );
+    }
+  } catch (e) {
+    console.log(`Failed to send a front message for ${protocol} (${dataType})`, e);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 export async function reportError({ message, protocol, dataType, correctSource, contact }: any) {
   const formattedMessage = `Protocol: ${protocol}
@@ -14,31 +44,28 @@ What's wrong: ${message}
 Correct data: ${correctSource}
 https://defillama.com/protocol/${sluggifyString(protocol)}`
 
-  const frontResponse = await fetch(`https://defillama.api.frontapp.com/channels/cha_kj4ps/incoming_messages`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.FRONT_API_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      sender: {
-        handle: contact ?? `Anon ${Math.round(Math.random()*1e5)}`,
-      },
-      subject: `Report: ${protocol} (${dataType})`,
-      body: formattedMessage,
-    }),
-  }).then(res => res.json());
-  
-  await getErrorDBConnection()`
-  insert into errorReports (
-    time, protocol, dataType, message, correctSource, contact
-  ) values (
-    ${getCurrentUnixTimestamp()}, ${protocol}, ${dataType ?? null}, ${message ?? null}, ${correctSource ?? null}, ${contact ?? null}
-  )`
-    await sendMessage(formattedMessage, process.env.ERROR_REPORTS_WEBHOOK, false)
-    .catch(e => console.log(`Failed to send a discord message for ${protocol} (${dataType})`, e))
+  const formData = new FormData();
+  formData.append('name', `${protocol} (${dataType})`);
+  formData.append('email', !contact || contact === "" ? `anon@defillama.com` : contact);
+  formData.append('body', formattedMessage);
 
+  try {
+    await sendMessage(formattedMessage, process.env.ERROR_REPORTS_WEBHOOK, false)
+      .catch(e => console.log(`Failed to send a discord message for ${protocol} (${dataType})`, e))
+    
+    await getErrorDBConnection()`
+    insert into errorReports (
+      time, protocol, dataType, message, correctSource, contact
+    ) values (
+      ${getCurrentUnixTimestamp()}, ${protocol}, ${dataType ?? null}, ${message ?? null}, ${correctSource ?? null}, ${contact ?? null}
+    )`
+  } catch (e) {
+    console.log('reportError error', e);
+  }
+
+  await submitFrontReport(formData, protocol, dataType);
 }
+
 const handler = async (event: AWSLambda.APIGatewayEvent): Promise<IResponse> => {
   try {
     const body = JSON.parse(event.body!);

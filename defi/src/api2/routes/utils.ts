@@ -1,5 +1,9 @@
 import * as HyperExpress from "hyper-express";
 import * as sdk from '@defillama/sdk'
+import { readRouteData, fileNameNormalizer } from "../cache/file-cache";
+
+const ACCEL_PREFIX = '/_internal/cache'
+const NGINX_ENABLED = process.env.NGINX_ENABLED && process.env.NGINX_ENABLED === 'true'
 
 function getTimeInFutureMinutes(minutes: number) {
   const date = new Date();
@@ -17,7 +21,7 @@ export function successResponse(res: HyperExpress.Response, data: any, cacheMinu
   })
   if (isPost)
     res.removeHeader("Expires")
-  
+
   isJson ? res.json(data) : res.send(data)
 }
 
@@ -38,4 +42,36 @@ export function errorWrapper(routeFn: any) {
       return res.send('Internal Error', true)
     }
   }
+}
+
+
+export async function fileResponse(filePath: string, res: HyperExpress.Response) {
+  if (NGINX_ENABLED) {
+    const normalized = fileNameNormalizer(filePath);
+    res.setHeader('X-Accel-Redirect', `${ACCEL_PREFIX}/${normalized}`);
+    return res.status(200).send('');
+  }
+
+  try {
+    res.set('Cache-Control', 'public, max-age=600'); // Set caching to 10 minutes
+    const ab = await readRouteData(filePath, { readAsArrayBuffer: true })
+    if (!ab) {
+      res.status(404)
+      return res.send('Data not found', true)
+    }
+    res.set('Content-Type', 'application/json')
+    res.send(ab)
+  } catch (e) {
+    console.error(e);
+    return errorResponse(res, 'Internal server error', { statusCode: 500 })
+  }
+}
+
+export function validateProRequest(req: HyperExpress.Request, res: HyperExpress.Response) {
+  if ((req as any).isProRequest) return true;
+
+  // throw error if not pro
+  res.status(402)
+  res.send('Upgrade to the paid API plan at https://defillama.com/subscription', true)
+  return false
 }

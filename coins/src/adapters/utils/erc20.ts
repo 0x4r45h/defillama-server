@@ -5,6 +5,28 @@ import { DbTokenInfos } from "./dbInterfaces";
 
 const project = "coins/erc20-data";
 const cacheObject = {} as any;
+const dirtyCacheKeys = new Set<string>();
+let flushHandlersRegistered = false;
+
+function registerFlushHandlers() {
+  if (flushHandlersRegistered) return;
+  flushHandlersRegistered = true;
+  const flush = async () => {
+    if (!dirtyCacheKeys.size) return;
+    const keys = Array.from(dirtyCacheKeys);
+    dirtyCacheKeys.clear();
+    await Promise.all(keys.map((cacheKey) => {
+      const [key, chain] = splitCacheKey(cacheKey);
+      return setCache(key, chain, cacheObject[cacheKey]);
+    }));
+  };
+  process.on("beforeExit", () => { flush().catch((e) => console.error("erc20 cache flush failed", e)); });
+}
+
+function splitCacheKey(cacheKey: string): [string, string] {
+  const idx = cacheKey.lastIndexOf("/");
+  return [cacheKey.slice(0, idx), cacheKey.slice(idx + 1)];
+}
 
 export async function getTokenInfo(
   chain: string = "ethereum",
@@ -17,10 +39,10 @@ export async function getTokenInfo(
 ): Promise<DbTokenInfos> {
   const { withSupply = false, timestamp } = params;
   targets = targets.map((i) => i.toLowerCase());
-  if (chain === 'solana') {
-    console.error('Solana not supported')
-    const decimals = targets.map(() => ({ output: 0, success: true }))
-    const symbols = targets.map(() => ({ output: '-', success: true }))
+  if (["solana", "sui", 'fogo'].includes(chain)) {
+    console.error('Solana|sui not supported')
+    const decimals = targets.map(() => ({ output: undefined, success: true }))
+    const symbols = targets.map(() => ({ output: undefined, success: true }))
     return { decimals, symbols, } as any
   }
 
@@ -152,6 +174,7 @@ export async function listUnknownTokens(
   unknownTokens = unknownTokens.map(
     (t, i) => `${unknownSymbols[i].output}-${t}`,
   );
+  if (!unknownTokens.length) return;
   console.log(chain);
   console.log(unknownTokens);
 }
@@ -182,7 +205,10 @@ async function _getCachedData(params: {
     permitFailure: true,
   });
   decimals.forEach((o, i) => (cache[missing[i]] = o));
-  await setCache(key, chain, cache);
+  if (missing.length) {
+    dirtyCacheKeys.add(cacheKey);
+    registerFlushHandlers();
+  }
 
   return targets.map((i) => {
     return {

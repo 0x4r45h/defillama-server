@@ -1,19 +1,881 @@
 import fetch from "node-fetch";
 import { sluggifyString } from "./utils/sluggify";
 import { storeR2 } from "./utils/r2";
-import { cexsData } from "./getCexs";
+import { cexsData } from "./protocols/cex";
+import protocols from "./protocols/data";
+import parentProtocolsList from "./protocols/parentProtocols";
+import { IChainMetadata, IProtocolMetadata } from "./api2/cron-task/types";
+import { sendMessage } from "./utils/discord";
+import sleep from "./utils/shared/sleep";
+import { getEnv } from "./api2/env";
+import { rwaSlug } from "./rwa/utils";
+import { cachedJSONPull } from "./api2/utils/cachedFunctions";
 
-const normalize = (str: string) =>
-  sluggifyString(str)
-    .replace(/[^a-zA-Z0-9_-]/, "")
-    .replace(/[^a-zA-Z0-9_-]/, "")
-    .replace(/[^a-zA-Z0-9_-]/, "");
-const standardizeProtocolName = (tokenName = "") => tokenName?.toLowerCase().split(" ").join("-").split("'").join("");
+// This script builds two Meilisearch indexes:
+// - `pages`: internal DefiLlama routes shown in app/global search.
+// - `directory`: external project URLs shown in directory-style search.
+//
+// Most top-level protocol and chain entities intentionally come from
+// `/lite/protocols2`. The smol appMetadata files are used to decide which
+// metric subpages each entity should expose, not as the default entity source.
+const normalize = (str: string) => (str ? sluggifyString(str).replace(/[^a-zA-Z0-9_-]/g, "") : "");
+
+// Split camelCase/PascalCase into space-separated words: "MakerDAO" → "Maker DAO", "DexScreener" → "Dex Screener"
+const splitCamelCase = (str: string) =>
+  str.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+
+// Build search name variants (no-spaces + camelCase-split) for a list of names, excluding duplicates and the original names
+function buildNameVariants(names: string[]): string[] {
+  const originals = new Set(names.map((n) => n.toLowerCase()));
+  const variants = new Set<string>();
+  for (const name of names) {
+    const noSpaces = name.replace(/\s+/g, "");
+    const split = splitCamelCase(name);
+    if (!originals.has(noSpaces.toLowerCase())) variants.add(noSpaces);
+    if (!originals.has(split.toLowerCase())) variants.add(split);
+  }
+  return [...variants];
+}
+
+interface SearchResult {
+  id: string;
+  name: string;
+  subName?: string;
+  symbol?: string;
+  route: string;
+  logo?: string;
+  tvl?: number;
+  mcap?: number;
+  volume?: number;
+  deprecated?: boolean;
+  type?: string;
+  hideType?: boolean;
+  mcapRank?: number;
+  previousNames?: string[];
+  nameVariants?: string[];
+  keywords?: string[];
+  routeAlias?: string;
+  // Up to 5 single-value copies of `keywords`. Meilisearch's `exactness`
+  // ranking rule concatenates array attributes, so an array-valued `keywords`
+  // field can only ever produce `matchesStart` for a single-word query. By
+  // mirroring each keyword into its own scalar field at the top of
+  // `searchable-attributes`, a query matching that keyword yields
+  // `exactMatch` (score 1.0) and lets `r:desc` rank important pages above
+  // same-named entities.
+  alias1?: string;
+  alias2?: string;
+  alias3?: string;
+  alias4?: string;
+  alias5?: string;
+  r?: number;
+  topLevelRank?: number;
+  v: number;
+}
+
+interface TokenSearchData {
+  name: string;
+  symbol: string;
+  token_nk: string;
+  route: string;
+  is_yields: boolean;
+  mcap_rank?: number;
+  logo?: string;
+}
+
+export const SEARCH_RANK = {
+  // Higher `r` wins after textual relevance. Keep navigation pages above
+  // entities for exact aliases like "yields", while subpages stay below parent
+  // entities and are found through parent names rather than generic tab names.
+  navPage: 4,
+  entity: 3,
+  collection: 2,
+  subPage: 1,
+  deprecated: -1,
+} as const;
+
+export const SEARCH_DEPTH_RANK = {
+  topLevel: 1,
+  subPage: 0,
+} as const;
+
+interface FrontendPage {
+  name: string;
+  route: string;
+  searchKeywords?: string[];
+}
+
+interface ProtocolSearchInput {
+  id: string;
+  name: string;
+  symbol?: string;
+  tvl?: number;
+  logo?: string;
+  route: string;
+  deprecated?: boolean;
+  previousNames?: string[];
+  v: number;
+}
+
+interface StablecoinSearchInput {
+  name: string;
+  symbol: string;
+  circulating: { peggedUSD: number };
+}
+
+interface ProtocolSearchSource {
+  name: string;
+  category?: string;
+  tvl?: number | null;
+}
+
+const HIDDEN_PROTOCOL_SEARCH_SLUGS = new Set(["akash-network"]);
+
+export const PAGES_INDEX_SETTINGS = {
+  searchableAttributes: [
+    "alias1",
+    "alias2",
+    "alias3",
+    "alias4",
+    "alias5",
+    "routeAlias",
+    "name",
+    "symbol",
+    "previousNames",
+    "nameVariants",
+    "keywords",
+  ],
+  rankingRules: [
+    "words",
+    "typo",
+    "proximity",
+    "topLevelRank:desc",
+    "exactness",
+    "r:desc",
+    "attribute",
+    "v:desc",
+    "sort",
+  ],
+  filterableAttributes: ["type", "deprecated", "subName"],
+  sortableAttributes: ["v", "tvl", "name", "mcapRank", "r", "topLevelRank"],
+  displayedAttributes: [
+    "id",
+    "name",
+    "type",
+    "logo",
+    "route",
+    "deprecated",
+    "hideType",
+    "previousNames",
+    "subName",
+    "symbol",
+  ],
+  synonyms: {
+    "stable": ["stablecoin", "stablecoins"],
+    "stablecoin": ["stable", "stablecoins"],
+    "stablecoins": ["stable", "stablecoin"],
+    "mcap": ["market cap", "marketcap"],
+    "marketcap": ["market cap", "mcap"],
+    "market cap": ["mcap", "marketcap"],
+    "tvl": ["total value locked"],
+    "apy": ["yield", "yields"],
+    "yield": ["apy", "yields"],
+    "yields": ["apy", "yield"],
+    "dex": ["dexs", "exchange"],
+    "dexs": ["dex", "exchanges"],
+    "cex": ["cexs", "exchange"],
+    "cexs": ["cex", "exchanges"],
+  },
+} as const;
+
+export const DIRECTORY_INDEX_SETTINGS = {
+  rankingRules: ["words", "typo", "proximity", "exactness", "r:desc", "attribute", "v:desc", "sort"],
+  displayedAttributes: ["name", "symbol", "logo", "route", "deprecated", "previousNames"],
+  searchableAttributes: ["name", "symbol", "previousNames", "nameVariants", "route"],
+  sortableAttributes: ["v", "tvl", "name", "r"],
+} as const;
+
+function getPageSearchKeywords(keywords?: string[]): string[] | undefined {
+  if (!Array.isArray(keywords)) return undefined;
+
+  const cleaned = Array.from(new Set(keywords.map((keyword) => keyword?.trim()).filter(Boolean)));
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+function getPageSearchAliases(
+  keywords: string[] | undefined
+): Pick<SearchResult, "alias1" | "alias2" | "alias3" | "alias4" | "alias5"> {
+  if (!keywords?.length) return {};
+  const aliases: Record<string, string> = {};
+  for (let i = 0; i < Math.min(keywords.length, 5); i++) {
+    aliases[`alias${i + 1}`] = keywords[i];
+  }
+  return aliases;
+}
+
+export function getFrontendPageRouteAlias(route: string): string | undefined {
+  const path = route.split("?")[0];
+  if (!path.startsWith("/")) return undefined;
+
+  const segment = path.slice(1);
+  if (!segment || segment.includes("/")) return undefined;
+
+  return segment.replace(/-/g, " ");
+}
+
+export function buildFrontendPageSearchResult({
+  id,
+  page,
+  type,
+  tastyMetrics,
+  hideType,
+}: {
+  id: string;
+  page: FrontendPage;
+  type: string;
+  tastyMetrics: Record<string, number>;
+  hideType?: boolean;
+}): SearchResult {
+  const keywords = getPageSearchKeywords(page.searchKeywords);
+  const routeAlias = getFrontendPageRouteAlias(page.route);
+
+  return {
+    id,
+    name: page.name,
+    route: page.route,
+    ...(keywords ? { keywords } : {}),
+    ...(routeAlias ? { routeAlias } : {}),
+    ...getPageSearchAliases(keywords),
+    r: SEARCH_RANK.navPage,
+    topLevelRank: SEARCH_DEPTH_RANK.topLevel,
+    v: tastyMetrics[page.route] ?? 0,
+    type,
+    ...(hideType ? { hideType } : {}),
+  };
+}
+
+export function buildProtocolSearchResult({
+  id,
+  name,
+  symbol,
+  tvl,
+  logo,
+  route,
+  deprecated,
+  previousNames,
+  v,
+}: ProtocolSearchInput): SearchResult {
+  const allNames = [name, ...(previousNames ?? [])];
+  const variants = buildNameVariants(allNames);
+
+  return {
+    id,
+    name,
+    ...(symbol ? { symbol } : {}),
+    ...(tvl !== undefined ? { tvl } : {}),
+    ...(logo ? { logo } : {}),
+    route,
+    ...(deprecated ? { deprecated: true } : {}),
+    ...(previousNames?.length ? { previousNames: [...previousNames] } : {}),
+    ...(variants.length ? { nameVariants: variants } : {}),
+    r: deprecated ? SEARCH_RANK.deprecated : SEARCH_RANK.entity,
+    topLevelRank: SEARCH_DEPTH_RANK.topLevel,
+    v,
+    type: "Protocol",
+  };
+}
+
+export function shouldSkipProtocolSearchResult(protocol: ProtocolSearchSource, chainNames: Set<string>) {
+  if (HIDDEN_PROTOCOL_SEARCH_SLUGS.has(sluggifyString(protocol.name))) return true;
+  return protocol.category === "Canonical Bridge" && chainNames.has(protocol.name) && !protocol.tvl;
+}
+
+export function buildStablecoinSearchResult(
+  stablecoin: StablecoinSearchInput,
+  tastyMetrics: Record<string, number>
+): SearchResult {
+  const slug = sluggifyString(stablecoin.name);
+  return {
+    id: `stablecoin_${normalize(stablecoin.name)}_${normalize(stablecoin.symbol)}`,
+    name: stablecoin.name,
+    symbol: stablecoin.symbol,
+    mcap: stablecoin.circulating.peggedUSD,
+    logo: `https://icons.llamao.fi/icons/pegged/${slug}?w=48&h=48`,
+    route: `/stablecoin/${slug}`,
+    r: SEARCH_RANK.entity,
+    topLevelRank: SEARCH_DEPTH_RANK.topLevel,
+    v: tastyMetrics[`/stablecoin/${slug}`] ?? 0,
+    type: "Stablecoin",
+  };
+}
+
+function mergeKeywords(...keywordSets: Array<string[] | undefined>): string[] | undefined {
+  const merged = Array.from(
+    new Set(keywordSets.flatMap((keywords) => keywords ?? []).map((keyword) => keyword.trim()))
+  );
+  return merged.length > 0 ? merged : undefined;
+}
+
+export function dedupeFrontendPageResults(results: SearchResult[]): SearchResult[] {
+  const deduped = new Map<string, SearchResult>();
+
+  for (const result of results) {
+    const dedupeKey = result.route;
+    const existing = deduped.get(dedupeKey);
+    if (!existing) {
+      deduped.set(dedupeKey, result);
+      continue;
+    }
+
+    // Two frontend pages resolve to the same route (e.g. sidebar "Stablecoins"
+    // and metric "Stablecoins by Market Cap" both point to `/stablecoins`).
+    // Collapse into one doc: keep the shorter/cleaner name for the UI, drop
+    // the longer one into `nameVariants` so it still matches at search time,
+    // and union `keywords` + recompute aliases.
+    const sameName = existing.name.trim().toLowerCase() === result.name.trim().toLowerCase();
+    const [primary, secondary] = result.name.length < existing.name.length ? [result, existing] : [existing, result];
+
+    const nameVariants = sameName
+      ? mergeKeywords(existing.nameVariants, result.nameVariants)
+      : mergeKeywords(existing.nameVariants, result.nameVariants, [secondary.name]);
+    const previousNames = mergeKeywords(existing.previousNames, result.previousNames);
+    const keywords = mergeKeywords(existing.keywords, result.keywords);
+
+    deduped.set(dedupeKey, {
+      ...primary,
+      ...(keywords ? { keywords } : {}),
+      ...(previousNames ? { previousNames } : {}),
+      ...(nameVariants ? { nameVariants } : {}),
+      ...(primary.routeAlias ?? secondary.routeAlias ? { routeAlias: primary.routeAlias ?? secondary.routeAlias } : {}),
+      ...getPageSearchAliases(keywords),
+      r: Math.max(existing.r ?? 0, result.r ?? 0),
+      v: Math.max(existing.v ?? 0, result.v ?? 0),
+    });
+  }
+
+  return Array.from(deduped.values());
+}
+
+export const getProtocolSubSections = ({
+  result,
+  metadata,
+  geckoId,
+  tastyMetrics,
+  protocolData,
+  childProtocols,
+}: {
+  result: SearchResult;
+  metadata: IProtocolMetadata;
+  geckoId: string | null;
+  tastyMetrics: Record<string, number>;
+  protocolData: { name: string; id?: string };
+  childProtocols?: Array<string>;
+}) => {
+  const subSections: Array<SearchResult> = [];
+
+  // Protocol metadata is a capability map. If a flag exists here, the
+  // frontend has a protocol route/query state for that metric, so we add a
+  // searchable child result for it.
+  if (result.tvl) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_tvl`,
+      subName: "TVL",
+      route: `${result.route}?tvl=true`,
+    });
+  }
+
+  if (metadata?.fees) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_fees`,
+      subName: "Fees",
+      route: `${result.route}?tvl=false&fees=true`,
+    });
+  }
+
+  if (metadata?.revenue) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_revenue`,
+      subName: "Revenue",
+      route: `${result.route}?tvl=false&revenue=true`,
+    });
+  }
+
+  if (metadata?.holdersRevenue) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_holdersRevenue`,
+      subName: "Holders Revenue",
+      route: `${result.route}?tvl=false&holdersRevenue=true`,
+    });
+  }
+
+  if (metadata?.dexs) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_dexVolume`,
+      subName: "DEX Volume",
+      route: `${result.route}?tvl=false&dexVolume=true`,
+    });
+  }
+
+  if (metadata?.perps) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_perpVolume`,
+      subName: "Perp Volume",
+      route: `${result.route}?tvl=false&perpVolume=true`,
+    });
+  }
+
+  if (metadata?.optionsPremiumVolume) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_optionsPremiumVolume`,
+      subName: "Options Premium Volume",
+      route: `${result.route}?tvl=false&optionsPremiumVolume=true`,
+    });
+  }
+
+  if (metadata?.optionsNotionalVolume) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_optionsNotionalVolume`,
+      subName: "Options Notional Volume",
+      route: `${result.route}?tvl=false&optionsNotionalVolume=true`,
+    });
+  }
+
+  if (metadata?.perpsAggregators) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_perpAggregatorVolume`,
+      subName: "Perp Aggregator Volume",
+      route: `${result.route}?tvl=false&perpAggregatorVolume=true`,
+    });
+  }
+
+  if (metadata?.bridgeAggregators) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_bridgeAggregatorVolume`,
+      subName: "Bridge Aggregator Volume",
+      route: `${result.route}?tvl=false&bridgeAggregatorVolume=true`,
+    });
+  }
+
+  if (metadata?.dexAggregators) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_dexAggregatorVolume`,
+      subName: "DEX Aggregator Volume",
+      route: `${result.route}?tvl=false&dexAggregatorVolume=true`,
+    });
+  }
+
+  if (metadata?.bridge) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_bridgeVolume`,
+      subName: "Bridge Volume",
+      route: `/bridge/${sluggifyString(protocolData.name)}`,
+    });
+  }
+
+  if (geckoId) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_mcap`,
+      subName: "Mcap",
+      route: `${result.route}?tvl=false&mcap=true`,
+    });
+    subSections.push({
+      ...result,
+      id: `${result.id}_fdv`,
+      subName: "FDV",
+      route: `${result.route}?tvl=false&fdv=true`,
+    });
+    subSections.push({
+      ...result,
+      id: `${result.id}_tokenPrice`,
+      subName: "Token Price",
+      route: `${result.route}?tvl=false&tokenPrice=true`,
+    });
+    subSections.push({
+      ...result,
+      id: `${result.id}_tokenVolume`,
+      subName: "Token Volume",
+      route: `${result.route}?tvl=false&tokenVolume=true`,
+    });
+  }
+
+  if (metadata?.liquidity) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_tokenLiquidity`,
+      subName: "Token Liquidity",
+      route: `${result.route}?tvl=false&tokenLiquidity=true`,
+    });
+  }
+
+  if (metadata?.emissions) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_unlocks`,
+      subName: "Unlocks",
+      route: `/unlocks/${sluggifyString(protocolData.name)}`,
+    });
+  }
+
+  if (metadata?.incentives) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_incentives`,
+      subName: "Incentives",
+      route: `${result.route}?tvl=false&incentives=true`,
+    });
+  }
+
+  if (metadata?.yields) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_yields`,
+      subName: "Yields",
+      route:
+        childProtocols && childProtocols.length > 0
+          ? `/yields?${childProtocols.map((p) => `project=${p}`).join("&")}`
+          : `/yields?project=${protocolData.name}`,
+    });
+    if (!protocolData?.id?.startsWith("parent#")) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_medianApy`,
+        subName: "Median APY",
+        route: `${result.route}?tvl=false&medianApy=true`,
+      });
+    }
+  }
+
+  if (metadata?.treasury) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_treasury`,
+      subName: "Treasury",
+      route: `/protocol/treasury/${sluggifyString(protocolData.name)}`,
+    });
+  }
+
+  if (metadata?.forks) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_forks`,
+      subName: "Forks",
+      route: `/protocol/forks/${sluggifyString(protocolData.name)}`,
+    });
+  }
+
+  if (metadata?.tokenRights) {
+    subSections.push({
+      ...result,
+      id: `${result.id}_tokenRights`,
+      subName: "Token Rights",
+      route: `/protocol/token-rights/${sluggifyString(protocolData.name)}`,
+    });
+  }
+
+  return subSections.map(({ symbol, routeAlias, ...rest }) => ({
+    ...rest,
+    v: tastyMetrics[rest.route] ?? 0,
+    r: rest.r === SEARCH_RANK.deprecated ? SEARCH_RANK.deprecated : SEARCH_RANK.subPage,
+    topLevelRank: SEARCH_DEPTH_RANK.subPage,
+  }));
+};
+
+async function getAllCurrentSearchResults(index: string) {
+  const allResults: Array<SearchResult> = [];
+  let offset = 0;
+  const limit = 100e3;
+  let hasMore = true;
+
+  while (hasMore) {
+    const res: { total: number; results: Array<SearchResult> } = await fetchJson(
+      `https://search-core.defillama.com/indexes/${index}/documents?limit=${limit}&offset=${offset}`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.SEARCH_MASTER_KEY}`,
+        },
+      }
+    );
+
+    if (!Array.isArray(res?.results)) {
+      console.log("Unexpected response while fetching search results:", res);
+      throw new Error("Failed to fetch search results from Search API");
+    }
+
+    allResults.push(...res.results);
+
+    // The delete step needs the complete current index so stale documents
+    // disappear when routes or ids are removed from this generator.
+    if (res.results.length < limit || allResults.length >= res.total) {
+      hasMore = false;
+    } else {
+      offset += limit;
+    }
+  }
+
+  return allResults;
+}
+
+function getResultsToDelete(currentResults: Array<SearchResult>, newResults: Array<SearchResult>) {
+  const newResultsSet = new Set(newResults.map((r) => r.id));
+
+  return currentResults
+    .map((item) => item.id)
+    .filter((itemId) => {
+      return !newResultsSet.has(itemId);
+    });
+}
+
+async function syncIndexSetting(index: string, setting: string, value: unknown) {
+  const submit = await fetchJson(`https://search-core.defillama.com/indexes/${index}/settings/${setting}`, {
+    method: "PUT",
+    headers: {
+      "Authorization": `Bearer ${process.env.SEARCH_MASTER_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(value),
+  });
+
+  let status: any;
+  let waitMs = 500;
+  const maxAttempts = 8;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    status = await fetchJson(`https://search-core.defillama.com/tasks/${submit.taskUid}`, {
+      headers: {
+        Authorization: `Bearer ${process.env.SEARCH_MASTER_KEY}`,
+      },
+    });
+
+    if (["succeeded", "failed", "canceled"].includes(status.status)) break;
+
+    if (attempt < maxAttempts) {
+      await sleep(waitMs);
+      waitMs *= 2;
+    }
+  }
+
+  console.log(`[${index}] ${setting} settings status:`, status);
+
+  const taskError = status?.error?.message ?? status?.details?.error?.message;
+  if (status?.status === "failed" || status?.status === "canceled") {
+    throw new Error(`[${index}] ${setting} settings ${status.status}: ${taskError ?? "unknown error"}`);
+  }
+  if (status?.status !== "succeeded") {
+    throw new Error(`[${index}] ${setting} settings did not finish before timeout`);
+  }
+}
+
+async function syncPagesIndexSettings() {
+  await syncIndexSetting("pages", "searchable-attributes", PAGES_INDEX_SETTINGS.searchableAttributes);
+  await syncIndexSetting("pages", "ranking-rules", PAGES_INDEX_SETTINGS.rankingRules);
+  await syncIndexSetting("pages", "filterable-attributes", PAGES_INDEX_SETTINGS.filterableAttributes);
+  await syncIndexSetting("pages", "sortable-attributes", PAGES_INDEX_SETTINGS.sortableAttributes);
+  await syncIndexSetting("pages", "displayed-attributes", PAGES_INDEX_SETTINGS.displayedAttributes);
+  await syncIndexSetting("pages", "synonyms", PAGES_INDEX_SETTINGS.synonyms);
+}
+
+async function syncDirectoryIndexSettings() {
+  await syncIndexSetting("directory", "ranking-rules", DIRECTORY_INDEX_SETTINGS.rankingRules);
+  await syncIndexSetting("directory", "displayed-attributes", DIRECTORY_INDEX_SETTINGS.displayedAttributes);
+  await syncIndexSetting("directory", "searchable-attributes", DIRECTORY_INDEX_SETTINGS.searchableAttributes);
+  await syncIndexSetting("directory", "sortable-attributes", DIRECTORY_INDEX_SETTINGS.sortableAttributes);
+}
+
+// Build previousNames lookup from raw protocol data (keyed by name)
+const previousNamesMap = new Map<string, string[]>();
+for (const p of protocols) {
+  if (p.previousNames?.length) previousNamesMap.set(p.name, p.previousNames as string[]);
+}
+for (const p of parentProtocolsList) {
+  if ((p as any).previousNames?.length) previousNamesMap.set(p.name, (p as any).previousNames);
+}
+
+// Local protocol data has richer display fields than smol metadata for some
+// rows. These maps let metadata-driven fallbacks recover the canonical display
+// name and symbol without changing the main `/lite/protocols2` entity source.
+const localProtocolById = new Map<string, any>();
+const localProtocolBySlug = new Map<string, any>();
+for (const p of protocols) {
+  localProtocolById.set(p.id, p);
+  localProtocolBySlug.set(sluggifyString(p.name), p);
+}
+for (const p of parentProtocolsList) {
+  localProtocolById.set((p as any).id, p);
+  localProtocolBySlug.set(sluggifyString((p as any).name), p);
+}
+
+function getMetadataProtocolName(protocolId: string, metadata: IProtocolMetadata) {
+  if (metadata.displayName) return metadata.displayName;
+
+  const localProtocol = localProtocolById.get(protocolId);
+  if (localProtocol?.name) return localProtocol.name;
+
+  const metadataSlug = metadata.name ?? (protocolId.startsWith("chain#") ? protocolId.slice("chain#".length) : "");
+  const protocolBySlug = metadataSlug ? localProtocolBySlug.get(metadataSlug) : null;
+  if (protocolBySlug?.name) return protocolBySlug.name;
+
+  return metadataSlug;
+}
+
+export function buildDirectoryResults(
+  tvlData: { parentProtocols: any[]; protocols: any[] },
+  parentTvl: Record<string, number>,
+  tastyMetrics: Record<string, number>
+) {
+  // Directory results are for external project URLs, not DefiLlama routes.
+  // They share much of the protocol naming/ranking data but dedupe by project
+  // URL because parent/child protocols often point to the same website.
+  const curatedExternalLinks = [
+    { name: "LlamaFeed", route: "https://llamafeed.io" },
+    { name: "Etherscan", route: "https://etherscan.io/" },
+  ].map((page) => ({
+    id: `others_${normalize(page.name)}`,
+    name: page.name,
+    route: page.route,
+    r: SEARCH_RANK.navPage,
+    v: 1000,
+  })) as Array<SearchResult>;
+
+  // Deduplicate by protocol URL, preferring parent protocols.
+  const stripTrailingSlash = (url: string) => url.replace(/\/+$/, "");
+  const urlToIndex = new Map<string, number>();
+  const directoryResults: Array<SearchResult> = [];
+
+  const deadUrlsBlacklist = new Set<string>();
+  const emptyChainNames = new Set<string>();
+
+  for (const parent of tvlData.parentProtocols) {
+    if (shouldSkipProtocolSearchResult(parent, emptyChainNames)) continue;
+
+    const route = `/protocol/${sluggifyString(parent.name)}`;
+    const prevNames = previousNamesMap.get(parent.name);
+    if (parent.referralUrl || parent.url)
+      urlToIndex.set(stripTrailingSlash(parent.referralUrl ?? parent.url), directoryResults.length);
+    const allNames = [parent.name, ...(prevNames ?? [])];
+    const variants = buildNameVariants(allNames);
+    if (parent.deadUrl) deadUrlsBlacklist.add(parent.url);
+    directoryResults.push({
+      id: `directory_parent_${normalize(parent.name)}`,
+      name: parent.name,
+      ...(parent.symbol && parent.symbol !== "-" ? { symbol: parent.symbol } : {}),
+      tvl: parentTvl[parent.id] ?? 0,
+      logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(parent.name)}?w=48&h=48`,
+      route: parent.deadUrl ? "" : parent.referralUrl ?? parent.url,
+      ...(parent.deprecated ? { deprecated: true } : {}),
+      ...(prevNames?.length ? { previousNames: [...prevNames] } : {}),
+      ...(variants.length ? { nameVariants: variants } : {}),
+      r: parent.deprecated ? SEARCH_RANK.deprecated : SEARCH_RANK.entity,
+      v: tastyMetrics[route] ?? 0,
+    });
+  }
+
+  for (const protocol of tvlData.protocols) {
+    if (shouldSkipProtocolSearchResult(protocol, emptyChainNames)) continue;
+
+    const prevNames = previousNamesMap.get(protocol.name) ?? [];
+    const protocolUrl =
+      protocol.referralUrl || protocol.url ? stripTrailingSlash(protocol.referralUrl ?? protocol.url) : "";
+    if (protocolUrl && urlToIndex.has(protocolUrl)) {
+      if (prevNames.length > 0) {
+        // Child shares URL with an existing entry — merge its previousNames into the parent
+        const parentIdx = urlToIndex.get(protocolUrl)!;
+        const parentEntry = directoryResults[parentIdx];
+        if (!parentEntry.previousNames) parentEntry.previousNames = [];
+        for (const name of prevNames) {
+          if (name !== parentEntry.name && !parentEntry.previousNames.includes(name)) {
+            parentEntry.previousNames.push(name);
+          }
+        }
+        // Rebuild variants with updated previousNames
+        const allNames = [parentEntry.name, ...parentEntry.previousNames];
+        const variants = buildNameVariants(allNames);
+        parentEntry.nameVariants = variants.length ? variants : undefined;
+      }
+      continue;
+    }
+    if (protocolUrl) urlToIndex.set(protocolUrl, directoryResults.length);
+    const route = `/protocol/${sluggifyString(protocol.name)}`;
+    const allNames = [protocol.name, ...(prevNames ?? [])];
+    const variants = buildNameVariants(allNames);
+    if (protocol.deadUrl) deadUrlsBlacklist.add(protocol.url);
+    directoryResults.push({
+      id: `directory_child_${normalize(protocol.name)}`,
+      name: protocol.name,
+      ...(protocol.symbol && protocol.symbol !== "-" ? { symbol: protocol.symbol } : {}),
+      tvl: protocol.tvl,
+      logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(protocol.name)}?w=48&h=48`,
+      route: protocol.deadUrl ? "" : protocolUrl,
+      ...(protocol.deprecated ? { deprecated: true } : {}),
+      ...(prevNames?.length ? { previousNames: [...prevNames] } : {}),
+      ...(variants.length ? { nameVariants: variants } : {}),
+      r: protocol.deprecated ? SEARCH_RANK.deprecated : SEARCH_RANK.entity,
+      v: tastyMetrics[route] ?? 0,
+    });
+  }
+
+  const cexs: Array<SearchResult> = cexsData
+    .filter((c) => c.slug && c.url)
+    .map((cex) => ({
+      id: `cex_${normalize(cex.name)}`,
+      name: cex.name,
+      ...(cex.coinSymbol ? { symbol: cex.coinSymbol } : {}),
+      route: cex.url!,
+      logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(cex.slug!)}?w=48&h=48`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/cex/${sluggifyString(cex.slug!)}`] ?? 0,
+    }));
+
+  const allResults = directoryResults
+    .concat(curatedExternalLinks)
+    .concat(cexs)
+    .filter((r) => {
+      const route = r.route?.trim();
+      return route && route !== "-" && !deadUrlsBlacklist.has(r.route);
+    });
+  const maxV = Math.max(...allResults.map((r) => r.v));
+  const swapEntry = allResults.find((r) => r.route === "https://swap.defillama.com");
+  if (swapEntry) swapEntry.v = maxV;
+  return allResults;
+}
 
 async function generateSearchList() {
   const endAt = Date.now();
   const startAt = endAt - 1000 * 60 * 60 * 24 * 90;
-  const [tvlData, stablecoinsData, frontendPages, tastyMetrics]: [
+  // Fetch all source datasets up front. The important split:
+  // - `/lite/protocols2` supplies protocol and parent protocol entities.
+  // - `appMetadata-chains.json` supplies chain entities and their metric pages.
+  // - `appMetadata-protocols.json` describes which metric pages exist for
+  //   protocol entities.
+  // - `pages.json` supplies static frontend navigation pages.
+  // - Tasty metrics provide recent route popularity for ranking within groups.
+  const [
+    tvlData,
+    stablecoinsData,
+    bridgesData,
+    frontendPages,
+    tastyMetrics,
+    protocolsMetadata,
+    chainsMetadata,
+    coinsData,
+    datsData,
+    rwaListData,
+    rwaTickerToNameMap,
+    rwaPerpsListData,
+    rwaPerpContractToNameMap,
+    equitiesData,
+  ]: [
     {
       chains: string[];
       parentProtocols: any[];
@@ -21,35 +883,99 @@ async function generateSearchList() {
       protocols: any[];
     },
     { peggedAssets: Array<{ name: string; symbol: string; circulating: { peggedUSD: number } }> },
-    Record<string, Array<{ name: string; route: string }>>,
-    Record<string, number>
+    { bridges: Array<{ name: string; displayName: string; icon: string; monthlyVolume: number; slug?: string }> },
+    Record<string, Array<{ name: string; route: string; searchKeywords?: string[] }>>,
+    Record<string, number>,
+    Record<string, IProtocolMetadata>,
+    Record<string, IChainMetadata>,
+    Record<string, TokenSearchData>,
+    {
+      assetMetadata: Record<string, { name: string; ticker: string }>;
+      institutionMetadata: Record<string, { name: string; ticker: string }>;
+    },
+    {
+      canonicalMarketIds: Array<string>;
+      platforms: Array<string>;
+      categories: Array<string>;
+      chains: Array<string>;
+    },
+    Record<string, string>,
+    { contracts: string[]; venues: string[]; assetGroups: string[] },
+    Record<string, string>,
+    Array<{ name: string; ticker: string }>
   ] = await Promise.all([
-    fetch("https://api.llama.fi/lite/protocols2").then((r) => r.json()),
-    fetch("https://stablecoins.llama.fi/stablecoins").then((r) => r.json()),
-    fetch("https://defillama.com/pages.json")
-      .then((r) => r.json())
-      .catch((e) => {
-        console.log("Error fetching frontend pages", e);
-        return {};
-      }),
-    fetch(`${process.env.TASTY_API_URL}/metrics?startAt=${startAt}&endAt=${endAt}&unit=day&type=url`, {
+    cachedJSONPull("https://api.llama.fi/lite/protocols2"),
+    cachedJSONPull("https://stablecoins.llama.fi/stablecoins"),
+    cachedJSONPull("https://bridges.llama.fi/bridges"),
+    cachedJSONPull("https://defillama.com/pages.json"),
+    cachedJSONPull({
+      endpoint: `${process.env.TASTY_API_URL}/metrics?startAt=${startAt}&endAt=${endAt}&unit=day&type=url&limit=10000`,
       headers: {
         Authorization: `Bearer ${process.env.TASTY_API_KEY}`,
       },
-    })
-      .then((r) => r.json())
-      .then((res: Array<{ x: string; y: number }>) => {
-        const final = {} as Record<string, number>;
-        for (const xy of res) {
-          final[xy.x] = xy.y;
-        }
-        return final;
-      })
-      .catch((e) => {
-        console.log("Error fetching tasty metrics", e);
-        return {};
-      }),
+      defaultResponse: [],
+    }).then((res: Array<{ x: string; y: number }>) => {
+      if (!Array.isArray(res)) {
+        console.log("Unexpected response while fetching tasty metrics:", res);
+        throw new Error("Failed to fetch tasty metrics from Tasty API");
+        // return {};
+      }
+
+      const final = {} as Record<string, number>;
+      for (const xy of res) {
+        final[xy.x] = xy.y;
+      }
+      return final;
+    }),
+    cachedJSONPull("https://api.llama.fi/config/smol/appMetadata-protocols.json"),
+    cachedJSONPull("https://api.llama.fi/config/smol/appMetadata-chains.json"),
+    cachedJSONPull("https://api.llama.fi/config/smol/token.json"),
+    cachedJSONPull(`https://pro-api.llama.fi/${getEnv("INTERNAL_API_KEY")}/dat/institutions`),
+    cachedJSONPull(`https://pro-api.llama.fi/${getEnv("INTERNAL_API_KEY")}/rwa/list`),
+    cachedJSONPull({
+      endpoint: `https://pro-api.llama.fi/${getEnv("INTERNAL_API_KEY")}/rwa/current`,
+      defaultResponse: [],
+    }).then((res) => {
+      if (!Array.isArray(res)) {
+        console.log("Unexpected response while fetching RWA canonical market id to name map:", res);
+        throw new Error("Failed to fetch RWA canonical market id to name map from RWA API");
+      }
+      const final = {} as Record<string, string>;
+      for (const rwa of res) {
+        if (rwa.category?.includes("RWA Perps")) continue;
+        if (!rwa.canonicalMarketId) continue;
+        if (final[rwa.canonicalMarketId]) continue;
+        final[rwa.canonicalMarketId] = rwa.assetName;
+      }
+      return final;
+    }),
+    cachedJSONPull(`https://pro-api.llama.fi/${getEnv("INTERNAL_API_KEY")}/rwa-perps/list`),
+    cachedJSONPull({
+      endpoint: `https://pro-api.llama.fi/${getEnv("INTERNAL_API_KEY")}/rwa-perps/current`,
+      defaultResponse: [],
+    }).then((res) => {
+      if (!Array.isArray(res)) {
+        console.log("Unexpected response while fetching RWA perps contract to name map:", res);
+        throw new Error("Failed to fetch RWA perps contract to name map from RWA API");
+      }
+      const final = {} as Record<string, string>;
+      for (const rwa of res) {
+        final[rwa.contract] = `${rwa.referenceAsset} - ${rwa.parentPlatform}`;
+      }
+      return final;
+    }),
+    cachedJSONPull(`https://pro-api.llama.fi/${getEnv("INTERNAL_API_KEY")}/equities/v1/companies`),
   ]);
+  if (!coinsData || Array.isArray(coinsData)) {
+    console.log("Unexpected response while reading token cache:", coinsData);
+    throw new Error("Failed to fetch token cache from https://api.llama.fi/config/smol/token.json");
+  }
+  const slugToProtocolName = new Map<string, string>();
+  for (const id in protocolsMetadata) {
+    const meta = protocolsMetadata[id];
+    if (!meta?.name || !meta?.displayName) continue;
+    slugToProtocolName.set(meta.name, meta.displayName);
+  }
   const parentTvl = {} as any;
   const chainTvl = {} as any;
   const categoryTvl = {} as any;
@@ -62,6 +988,8 @@ async function generateSearchList() {
     }
   };
   for (const p of tvlData.protocols) {
+    // Aggregate protocol TVL into the collection entities that search exposes:
+    // chains, categories, tags, and parent protocols.
     for (const chain in p.chainTvls) {
       addOrCreate(chainTvl, chain, (p.chainTvls[chain] as any).tvl);
     }
@@ -74,188 +1002,827 @@ async function generateSearchList() {
     }
   }
 
-  const protocols = tvlData.parentProtocols
-    .map((parent) => ({
+  const protocols: Array<SearchResult> = [];
+  const subProtocols: Array<SearchResult> = [];
+  const metadataChainSlugs = new Set<string>();
+  const metadataChainNames = new Set<string>();
+  for (const chainSlug in chainsMetadata) {
+    metadataChainSlugs.add(chainSlug);
+    metadataChainNames.add(chainsMetadata[chainSlug].name);
+  }
+
+  // Parent protocols are first-class protocol search results. Their child
+  // protocol names are only needed for subpage routes like grouped yields.
+  for (const parent of tvlData.parentProtocols) {
+    if (shouldSkipProtocolSearchResult(parent, metadataChainNames)) continue;
+
+    const prevNames = previousNamesMap.get(parent.name);
+    const result = buildProtocolSearchResult({
       id: `protocol_parent_${normalize(parent.name)}`,
       name: parent.name,
       symbol: parent.symbol,
       tvl: parentTvl[parent.id] ?? 0,
-      logo: `https://icons.llamao.fi/icons/protocols/${standardizeProtocolName(parent.name)}?w=48&h=48`,
-      route: `/protocol/${standardizeProtocolName(parent.name)}`,
-      v: tastyMetrics[`/protocol/${standardizeProtocolName(parent.name)}`] ?? 0,
-      type: "Protocol",
-    }))
-    .concat(
-      tvlData.protocols.filter(p => p.name !== 'LlamaSwap').map((p) => ({
-        id: `protocol_${normalize(p.name)}`,
-        name: p.name,
-        symbol: p.symbol,
-        tvl: p.tvl,
-        logo: `https://icons.llamao.fi/icons/protocols/${standardizeProtocolName(p.name)}?w=48&h=48`,
-        route: `/protocol/${standardizeProtocolName(p.name)}`,
-        ...(p.deprecated ? { deprecated: true } : {}),
-        v: tastyMetrics[`/protocol/${standardizeProtocolName(p.name)}`] ?? 0,
-        type: "Protocol",
+      logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(parent.name)}?w=48&h=48`,
+      route: `/protocol/${sluggifyString(parent.name)}`,
+      deprecated: parent.deprecated,
+      previousNames: prevNames,
+      v: tastyMetrics[`/protocol/${sluggifyString(parent.name)}`] ?? 0,
+    });
+
+    protocols.push(result);
+
+    const metadata = protocolsMetadata[parent.id];
+    const childProtocols = tvlData.protocols.filter((p) => p.parentProtocol === parent.id).map((p) => p.name);
+    const subSections = getProtocolSubSections({
+      result,
+      metadata,
+      geckoId: parent.gecko_id ?? null,
+      tastyMetrics,
+      protocolData: parent,
+      childProtocols,
+    });
+    subProtocols.push(...subSections);
+  }
+
+  // Child protocols are also first-class protocol search results. This list is
+  // still `/lite/protocols2`, so protocols missing there are intentionally not
+  // added unless they hit the narrow `chain#` fallback below.
+  for (const protocol of tvlData.protocols) {
+    if (protocol.name === "LlamaSwap") continue;
+    if (shouldSkipProtocolSearchResult(protocol, metadataChainNames)) continue;
+    const prevNames = previousNamesMap.get(protocol.name);
+    const result = buildProtocolSearchResult({
+      id: `protocol_${normalize(protocol.name)}`,
+      name: protocol.name,
+      symbol: protocol.symbol,
+      tvl: protocol.tvl,
+      logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(protocol.name)}?w=48&h=48`,
+      route: `/protocol/${sluggifyString(protocol.name)}`,
+      deprecated: protocol.deprecated,
+      previousNames: prevNames,
+      v: tastyMetrics[`/protocol/${sluggifyString(protocol.name)}`] ?? 0,
+    });
+
+    protocols.push(result);
+
+    const metadata = protocolsMetadata[protocol.defillamaId];
+    const subSections = getProtocolSubSections({
+      result,
+      metadata,
+      geckoId: protocol.geckoId ?? null,
+      tastyMetrics,
+      protocolData: protocol,
+    });
+    subProtocols.push(...subSections);
+  }
+
+  // Some chains are represented as protocol metadata rows named `chain#slug`
+  // because they have app-level dimensions such as fees/revenue, but they may
+  // not appear in chain app metadata. If no chain page exists, promote that
+  // `chain#` row into protocol search so users can still reach
+  // `/protocol/:chainName` and its metric subpages. Do not use this as a
+  // generic metadata-only protocol fallback.
+  for (const protocolId in protocolsMetadata) {
+    if (!protocolId.startsWith("chain#")) continue;
+    if (metadataChainSlugs.has(protocolId.slice("chain#".length))) continue;
+
+    const metadata = protocolsMetadata[protocolId];
+    const name = getMetadataProtocolName(protocolId, metadata);
+    if (!name) continue;
+
+    const prevNames = previousNamesMap.get(name);
+    const symbol = localProtocolBySlug.get(sluggifyString(name))?.symbol;
+    const result = buildProtocolSearchResult({
+      id: `protocol_${normalize(protocolId)}`,
+      name,
+      ...(symbol && symbol !== "-" ? { symbol } : {}),
+      logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(name)}?w=48&h=48`,
+      route: `/protocol/${sluggifyString(name)}`,
+      previousNames: prevNames,
+      v: tastyMetrics[`/protocol/${sluggifyString(name)}`] ?? 0,
+    });
+
+    protocols.push(result);
+    subProtocols.push(
+      ...getProtocolSubSections({
+        result,
+        metadata,
+        geckoId: metadata.gecko_id ?? null,
+        tastyMetrics,
+        protocolData: { name, id: protocolId },
+      })
+    );
+  }
+
+  const rwaChainsSet = new Set<string>(rwaListData.chains ?? []);
+  const chains: Array<SearchResult> = [];
+  const subChains: Array<SearchResult> = [];
+  // Chain entities come from app metadata. TVL data can enrich those rows, but
+  // absence from `/lite/protocols2.chains` should not hide chains that have
+  // valid app-level metric pages.
+  for (const chainSlug in chainsMetadata) {
+    const metadata = chainsMetadata[chainSlug];
+    const chain = metadata.name;
+    const result = {
+      id: `chain_${normalize(chain)}`,
+      name: chain,
+      logo: `https://icons.llamao.fi/icons/chains/rsz_${chainSlug}?w=48&h=48`,
+      tvl: chainTvl[chain],
+      route: `/chain/${chainSlug}`,
+      r: SEARCH_RANK.entity,
+      v: tastyMetrics[`/chain/${chainSlug}`] ?? 0,
+      type: "Chain",
+    };
+
+    chains.push(result);
+
+    const subSections: Array<SearchResult> = [];
+
+    if (metadata?.stablecoins) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_stablecoinsMcap`,
+        subName: "Stablecoins Mcap",
+        route: `${result.route}?tvl=false&stablecoinsMcap=true`,
+      });
+
+      subSections.push({
+        ...result,
+        id: `${result.id}_stablecoinsSupplyRankings`,
+        subName: "Stablecoins Supply Rankings",
+        route: `/stablecoins/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.chainFees) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_chainFees`,
+        subName: "Chain Fees",
+        route: `${result.route}?tvl=false&chainFees=true`,
+      });
+    }
+
+    if (metadata?.chainRevenue) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_chainRevenue`,
+        subName: "Chain Revenue",
+        route: `${result.route}?tvl=false&chainRevenue=true`,
+      });
+    }
+
+    if (metadata?.fees) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_appFees`,
+        subName: "App Fees",
+        route: `${result.route}?tvl=false&appFees=true`,
+      });
+
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByFees`,
+        subName: "Protocols by Fees",
+        route: `/fees/chain/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.revenue) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_appRevenue`,
+        subName: "App Revenue",
+        route: `${result.route}?tvl=false&appRevenue=true`,
+      });
+
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByRevenue`,
+        subName: "Protocols by Revenue",
+        route: `/revenue/chain/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.dexs) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_dexsVolume`,
+        subName: "DEXs Volume",
+        route: `${result.route}?tvl=false&dexsVolume=true`,
+      });
+
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByDexVolume`,
+        subName: "Protocols by DEX Volume",
+        route: `/dexs/chain/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.perps) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_perpsVolume`,
+        subName: "Perps Volume",
+        route: `${result.route}?tvl=false&perpsVolume=true`,
+      });
+
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByPerpVolume`,
+        subName: "Protocols by Perp Volume",
+        route: `/perps/chain/${sluggifyString(chain)}`,
+      });
+
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByOpenInterest`,
+        subName: "Protocols by Open Interest",
+        route: `/open-interest/chain/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.optionsPremiumVolume) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByOptionPremiumVolume`,
+        subName: "Protocols by Option Premium Volume",
+        route: `/options/premium-volume/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.optionsNotionalVolume) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByOptionNotionalVolume`,
+        subName: "Protocols by Option Notional Volume",
+        route: `/options/notional-volume/chain/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.dexAggregators) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByDexAggregatorVolume`,
+        subName: "Protocols by DEX Aggregator Volume",
+        route: `/dex-aggregators/chain/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.bridgeAggregators) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByBridgeAggregatorVolume`,
+        subName: "Protocols by Bridge Aggregator Volume",
+        route: `/bridge-aggregators/chain/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.perpsAggregators) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_protocolsByPerpAggregatorVolume`,
+        subName: "Protocols by Perp Aggregator Volume",
+        route: `/perps-aggregators/chain/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.chainAssets) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_bridgedTvl`,
+        subName: "Bridged TVL",
+        route: `/bridged/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (metadata?.inflows) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_netInflows`,
+        subName: "Net Inflows",
+        route: `${result.route}?tvl=false&netInflows=true`,
+      });
+    }
+
+    if (metadata?.incentives) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_incentives`,
+        subName: "Incentives",
+        route: `${result.route}?tvl=false&tokenIncentives=true`,
+      });
+    }
+
+    if (metadata?.activeUsers) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_activeAddresses`,
+        subName: "Active Addresses",
+        route: `${result.route}?tvl=false&activeAddresses=true`,
+      });
+
+      subSections.push({
+        ...result,
+        id: `${result.id}_transactions`,
+        subName: "Transactions",
+        route: `${result.route}?tvl=false&transactions=true`,
+      });
+    }
+
+    if (metadata?.gecko_id) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_chainTokenPrice`,
+        subName: `${metadata.tokenSymbol ?? "Token"} Price`,
+        route: `${result.route}?tvl=false&chainTokenPrice=true`,
+      });
+
+      subSections.push({
+        ...result,
+        id: `${result.id}_chainTokenMcap`,
+        subName: `${metadata.tokenSymbol ?? "Token"} Mcap`,
+        route: `${result.route}?tvl=false&chainTokenMcap=true`,
+      });
+
+      subSections.push({
+        ...result,
+        id: `${result.id}_chainTokenVolume`,
+        subName: `${metadata.tokenSymbol ?? "Token"} Volume`,
+        route: `${result.route}?tvl=false&chainTokenVolume=true`,
+      });
+    }
+
+    if (metadata?.normalizedVolume) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_normalizedVolume`,
+        subName: "Normalized Volume",
+        route: `/normalized-volume/chain/${sluggifyString(chain)}`,
+      });
+    }
+
+    if (rwaChainsSet.has(chain)) {
+      subSections.push({
+        ...result,
+        id: `${result.id}_rwa`,
+        subName: "RWA",
+        route: `/rwa/chain/${rwaSlug(chain)}`,
+      });
+    }
+
+    subChains.push(
+      ...subSections.map(({ symbol, routeAlias, ...rest }) => ({
+        ...rest,
+        v: tastyMetrics[rest.route] ?? 0,
+        r: SEARCH_RANK.subPage,
+        topLevelRank: SEARCH_DEPTH_RANK.subPage,
       }))
     );
+  }
 
-  const chains = tvlData.chains.map((chain) => ({
-    id: `chain_${normalize(chain)}`,
-    name: chain,
-    logo: `https://icons.llamao.fi/icons/chains/rsz_${standardizeProtocolName(chain)}?w=48&h=48`,
-    tvl: chainTvl[chain],
-    route: `/chain/${standardizeProtocolName(chain)}`,
-    v: tastyMetrics[`/chain/${standardizeProtocolName(chain)}`] ?? 0,
-    type: "Chain",
-  }));
+  const categories: Array<SearchResult> = [];
+  const categoriesToExclude = new Set([
+    "RWA",
+    "RWA Perps",
+    "Dex Aggregator",
+    "Bridge Aggregator",
+    "Perp Aggregator",
+    "Derivatives",
+    "Liquidations",
+  ]);
 
-  const categories = [] as any[];
   for (const category in categoryTvl) {
+    if (categoriesToExclude.has(category)) continue;
     categories.push({
       id: `category_${normalize(category)}`,
       name: category,
       tvl: categoryTvl[category],
-      route: `/protocols/${standardizeProtocolName(category)}`,
-      v: tastyMetrics[`/protocols/${standardizeProtocolName(category)}`] ?? 0,
+      route: `/protocols/${sluggifyString(category)}`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/protocols/${sluggifyString(category)}`] ?? 0,
       type: "Category",
     });
   }
 
-  const tags = [] as any[];
+  const tags: Array<SearchResult> = [];
+
   for (const tag in tagTvl) {
     tags.push({
       id: `tag_${normalize(tag)}`,
       name: tag,
       tvl: tagTvl[tag],
-      route: `/protocols/${standardizeProtocolName(tag)}`,
-      v: tastyMetrics[`/protocols/${standardizeProtocolName(tag)}`] ?? 0,
+      route: `/protocols/${sluggifyString(tag)}`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/protocols/${sluggifyString(tag)}`] ?? 0,
       type: "Tag",
     });
   }
 
-  const stablecoins = stablecoinsData.peggedAssets.map((stablecoin) => ({
-    id: `stablecoin_${normalize(stablecoin.name)}_${normalize(stablecoin.symbol)}`,
-    name: stablecoin.name,
-    symbol: stablecoin.symbol,
-    mcap: stablecoin.circulating.peggedUSD,
-    logo: `https://icons.llamao.fi/icons/pegged/${standardizeProtocolName(stablecoin.name)}?w=48&h=48`,
-    route: `/stablecoin/${standardizeProtocolName(stablecoin.name)}`,
-    v: tastyMetrics[`/stablecoin/${standardizeProtocolName(stablecoin.name)}`] ?? 0,
-    type: "Stablecoin",
-  }));
+  const stablecoins: Array<SearchResult> = stablecoinsData.peggedAssets.map((stablecoin) =>
+    buildStablecoinSearchResult(stablecoin, tastyMetrics)
+  );
 
-  const metrics = (frontendPages["Metrics"] ?? []).map((i) => ({
-    id: `insight_${normalize(i.name)}`,
-    name: i.name,
-    route: i.route,
-    v: tastyMetrics[i.route] ?? 0,
-    type: "Metric",
-  }));
-  const tools = (frontendPages["Tools"] ?? []).map((t) => ({
-    id: `tool_${normalize(t.name)}`,
-    name: t.name,
-    route: t.route,
-    v: tastyMetrics[t.route] ?? 0,
-    type: "Tool",
-  }));
+  const bridges: Array<SearchResult> = [];
+  for (const brg of bridgesData.bridges) {
+    if (brg.slug) continue;
+    bridges.push({
+      id: `bridge_${normalize(brg.name)}`,
+      name: brg.displayName,
+      volume: brg.monthlyVolume,
+      logo: `https://icons.llamao.fi/icons/protocols/${brg.icon.split(":")[1]}?w=48&h=48`,
+      route: `/bridge/${brg.slug ?? sluggifyString(brg.displayName ?? brg.name)}`,
+      r: SEARCH_RANK.entity,
+      v: tastyMetrics[`/bridge/${brg.slug}`] ?? 0,
+      type: "Bridge",
+    });
+  }
 
-  const otherPages = []
+  // Frontend pages are static navigation/search shortcuts. They can have
+  // keyword aliases, and duplicate routes are collapsed below.
+  let metrics: Array<SearchResult> = (frontendPages["Metrics"] ?? []).map((page) =>
+    buildFrontendPageSearchResult({
+      id: `metric_${normalize(page.name)}`,
+      page,
+      type: "Metric",
+      tastyMetrics,
+    })
+  );
+
+  let tools: Array<SearchResult> = (frontendPages["Tools"] ?? []).map((page) =>
+    buildFrontendPageSearchResult({
+      id: `tool_${normalize(page.name)}`,
+      page,
+      type: "Tool",
+      tastyMetrics,
+    })
+  );
+
+  let otherPages: Array<SearchResult> = [];
   for (const category in frontendPages) {
-    if (['Metrics', 'Tools'].includes(category)) continue;
+    if (["Metrics", "Tools"].includes(category)) continue;
     for (const page of frontendPages[category]) {
-      otherPages.push({
-        id: `page_${normalize(page.name)}`,
-        name: page.name,
-        route: page.route,
-        v: tastyMetrics[page.route] ?? 0,
-        type: "Insight",
-      });
+      otherPages.push(
+        buildFrontendPageSearchResult({
+          id: `others_${normalize(page.name)}`,
+          page,
+          type: "Others",
+          tastyMetrics,
+          hideType: true,
+        })
+      );
     }
   }
 
-  const cexs = cexsData
+  const dedupedFrontendPages = dedupeFrontendPageResults([...metrics, ...tools, ...otherPages]);
+  metrics = dedupedFrontendPages.filter((page) => page.type === "Metric");
+  tools = dedupedFrontendPages.filter((page) => page.type === "Tool");
+  otherPages = dedupedFrontendPages.filter((page) => page.type === "Others");
+
+  const cexs: Array<SearchResult> = cexsData
     .filter((c) => c.slug)
     .map((c) => ({
       id: `cex_${normalize(c.name)}`,
       name: c.name,
-      route: `/cex/${standardizeProtocolName(c.slug)}`,
-      logo: `https://icons.llamao.fi/icons/protocols/${standardizeProtocolName(c.slug)}?w=48&h=48`,
-      v: tastyMetrics[`/cex/${standardizeProtocolName(c.slug)}`] ?? 0,
+      route: `/cex/${sluggifyString(c.slug!)}`,
+      logo: `https://icons.llamao.fi/icons/protocols/${sluggifyString(c.slug!)}?w=48&h=48`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/cex/${sluggifyString(c.slug!)}`] ?? 0,
       type: "CEX",
     }));
 
-  const results = {
-    chains: chains.sort((a, b) => b.v - a.v),
-    protocols: protocols.sort((a, b) => b.v - a.v),
-    stablecoins: stablecoins.sort((a, b) => b.v - a.v),
-    metrics: metrics.sort((a, b) => b.v - a.v),
-    tools: tools.sort((a, b) => b.v - a.v),
-    categories: categories.sort((a, b) => b.v - a.v),
-    tags: tags.sort((a, b) => b.v - a.v),
-    cexs: cexs.sort((a, b) => b.v - a.v),
-    otherPages: otherPages.sort((a, b) => b.v - a.v),
-  };
+  const coins: Array<SearchResult> = [];
+  for (const tokenKey in coinsData) {
+    const coin = coinsData[tokenKey];
+    coins.push({
+      id: `${coin.token_nk.replace(/[^a-zA-Z0-9_-]/g, "_")}_token`,
+      name: coin.symbol,
+      route: `/token/${encodeURIComponent(coin.symbol)}`,
+      ...(coin.logo ? { logo: coin.logo } : {}),
+      mcapRank: coin.mcap_rank ?? 0,
+      r: SEARCH_RANK.subPage,
+      v: tastyMetrics[`/token/${coin.symbol}`] ?? 0,
+      type: "Token",
+    });
+  }
+
+  const dats: Array<SearchResult> = [];
+  for (const asset in datsData.assetMetadata ?? {}) {
+    dats.push({
+      id: `dat_asset_${normalize(datsData.assetMetadata[asset].name)}`,
+      name: datsData.assetMetadata[asset].name,
+      symbol: datsData.assetMetadata[asset].ticker,
+      route: `/digital-asset-treasuries/${asset}`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/digital-asset-treasuries/${asset}`] ?? 0,
+      type: "DAT",
+    });
+  }
+  for (const institution in datsData.institutionMetadata ?? {}) {
+    dats.push({
+      id: `dat_institution_${normalize(datsData.institutionMetadata[institution].ticker)}`,
+      name: datsData.institutionMetadata[institution].name,
+      symbol: datsData.institutionMetadata[institution].ticker,
+      route: `/digital-asset-treasury/${sluggifyString(datsData.institutionMetadata[institution].ticker)}`,
+      r: SEARCH_RANK.collection,
+      v:
+        tastyMetrics[`/digital-asset-treasury/${sluggifyString(datsData.institutionMetadata[institution].ticker)}`] ??
+        0,
+      type: "DAT",
+    });
+  }
+  const rwaList: Array<SearchResult> = [];
+  for (const canonicalMarketId of rwaListData.canonicalMarketIds) {
+    const name = rwaTickerToNameMap[canonicalMarketId];
+    const encodedCanonicalMarketId = encodeURIComponent(canonicalMarketId);
+    rwaList.push({
+      id: `rwa_asset_${normalize(canonicalMarketId)}`,
+      ...(name ? { name, symbol: canonicalMarketId } : { name: canonicalMarketId }),
+      route: `/rwa/asset/${encodedCanonicalMarketId}`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/rwa/asset/${encodedCanonicalMarketId}`] ?? 0,
+      type: "RWA",
+    });
+  }
+  for (const platform of rwaListData.platforms) {
+    const platformSlug = rwaSlug(platform);
+    rwaList.push({
+      id: `rwa_platform_${normalize(platformSlug)}`,
+      name: platform,
+      route: `/rwa/platform/${platformSlug}`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/rwa/platform/${platformSlug}`] ?? 0,
+      type: "RWA",
+    });
+  }
+  for (const category of rwaListData.categories) {
+    const categorySlug = rwaSlug(category);
+    if (categorySlug === "rwa-perps") continue;
+    rwaList.push({
+      id: `rwa_category_${normalize(categorySlug)}`,
+      name: category,
+      route: `/rwa/category/${categorySlug}`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/rwa/category/${categorySlug}`] ?? 0,
+      type: "RWA",
+    });
+  }
+  const rwaPerpsList: Array<SearchResult> = [];
+  for (const contract of rwaPerpsListData.contracts) {
+    const name = rwaPerpContractToNameMap[contract];
+    if (!name) continue;
+    rwaPerpsList.push({
+      id: `rwa_perps_contract_${normalize(contract)}`,
+      name: name,
+      route: `/rwa/perps/contract/${encodeURIComponent(contract)}`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/rwa/perps/contract/${encodeURIComponent(contract)}`] ?? 0,
+      type: "RWA Perps",
+    });
+  }
+  for (const venue of rwaPerpsListData.venues) {
+    rwaPerpsList.push({
+      id: `rwa_perps_venue_${normalize(venue)}`,
+      name: venue,
+      route: `/rwa/perps/venue/${rwaSlug(venue)}`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/rwa/perps/venue/${rwaSlug(venue)}`] ?? 0,
+      type: "RWA Perps",
+    });
+  }
+  for (const assetGroup of rwaPerpsListData.assetGroups) {
+    rwaPerpsList.push({
+      id: `rwa_perps_asset_group_${normalize(assetGroup)}`,
+      name: assetGroup,
+      route: `/rwa/perps/asset-group/${rwaSlug(assetGroup)}`,
+      r: SEARCH_RANK.collection,
+      v: tastyMetrics[`/rwa/perps/asset-group/${rwaSlug(assetGroup)}`] ?? 0,
+      type: "RWA Perps",
+    });
+  }
+  const equities: Array<SearchResult> = equitiesData.map((equity) => ({
+    id: `equity_${normalize(equity.name)}_${normalize(equity.ticker)}`,
+    name: equity.name,
+    symbol: equity.ticker,
+    logo: `https://icons.llamao.fi/icons/equities/${equity.ticker}?w=48&h=48`,
+    route: `/equities/${equity.ticker.toLowerCase()}`,
+    r: SEARCH_RANK.collection,
+    v: tastyMetrics[`/equities/${equity.ticker.toLowerCase()}`] ?? 0,
+    type: "Equities",
+  }));
+
+  const sortDesc = (a: any, b: any) => (b.v ?? 0) - (a.v ?? 0);
+  // Sort each visible group by recent route popularity before concatenating.
+  // Cross-group ordering is mostly controlled by Meilisearch relevance + `r`.
+  const sortedGroups = [
+    chains,
+    protocols,
+    stablecoins,
+    bridges,
+    metrics,
+    tools,
+    categories,
+    tags,
+    cexs,
+    otherPages,
+    dats,
+    rwaList,
+    rwaPerpsList,
+    equities,
+  ] as const;
+  for (const group of sortedGroups) group.sort(sortDesc);
 
   return {
+    // The pages index contains entities, frontend pages, metric subpages, and
+    // long-tail token/RWA/equity routes.
     results: [
-      ...results.chains,
-      ...results.protocols,
-      ...results.stablecoins,
-      ...results.metrics,
-      ...results.tools,
-      ...results.categories,
-      ...results.tags,
-      ...results.cexs,
-      ...results.otherPages,
-    ],
-    topResults: [
-      ...results.chains.slice(0, 3),
-      ...results.protocols.slice(0, 3),
-      ...results.stablecoins.slice(0, 3),
-      ...results.metrics.slice(0, 3),
-      ...results.categories.slice(0, 3),
-      ...results.tools.slice(0, 3),
-      ...results.tags.slice(0, 3),
-    ].map((r) => ({
-      ...r,
-      v: 0,
+      ...chains,
+      ...protocols,
+      ...stablecoins,
+      ...bridges,
+      ...metrics,
+      ...tools,
+      ...categories,
+      ...tags,
+      ...cexs,
+      ...otherPages,
+      ...subProtocols,
+      ...subChains,
+      ...coins,
+      ...dats,
+      ...rwaList,
+      ...rwaPerpsList,
+      ...equities,
+    ].map((result: any) => ({
+      ...result,
+      r: result.r ?? 1,
+      topLevelRank: result.topLevelRank ?? SEARCH_DEPTH_RANK.topLevel,
     })),
+    directoryResults: buildDirectoryResults(tvlData, parentTvl, tastyMetrics),
+    // `searchlist.json` is a small popular-results fallback, not the complete
+    // search corpus.
+    topResults: [chains, protocols, stablecoins, metrics, categories, tools, tags]
+      .flatMap((g) => g.slice(0, 3))
+      .map((r) => ({ ...r, v: 0 })),
   };
 }
 
-const main = async () => {
-  const { results, topResults } = await generateSearchList();
+async function syncIndex(index: string, newResults: Array<SearchResult>) {
+  const currentResults = await getAllCurrentSearchResults(index);
+  const toDelete = getResultsToDelete(currentResults, newResults);
 
-  await fetch(`https://search.defillama.com/indexes/pages/documents`, {
-    method: "DELETE",
-    headers: {
-      Authorization: `Bearer ${process.env.SEARCH_MASTER_KEY}`,
-    },
-  }).then((r) => r.json());
-  const submit = await fetch(`https://search.defillama.com/indexes/pages/documents`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.SEARCH_MASTER_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(results),
-  }).then((r) => r.json());
-  const status = await fetch(`https://search.defillama.com/tasks/${submit.taskUid}`, {
-    headers: {
-      Authorization: `Bearer ${process.env.SEARCH_MASTER_KEY}`,
-    },
-  }).then((r) => r.json());
+  if (toDelete.length > 0) {
+    const deleteRes = await fetchJson(`https://search-core.defillama.com/indexes/${index}/documents/delete-batch`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.SEARCH_MASTER_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(toDelete),
+    });
+
+    const deleteError = deleteRes?.details?.error?.message;
+    if (deleteError) {
+      console.log(`[${index}] delete error:`, deleteError);
+    }
+  }
+
+  if (newResults.length > 0) {
+    const submit = await fetchJson(`https://search-core.defillama.com/indexes/${index}/documents`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.SEARCH_MASTER_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(newResults),
+    });
+
+    const status = await fetchJson(`https://search-core.defillama.com/tasks/${submit.taskUid}`, {
+      headers: {
+        Authorization: `Bearer ${process.env.SEARCH_MASTER_KEY}`,
+      },
+    });
+
+    const submitError = status?.details?.error?.message;
+    if (submitError) {
+      console.log(`[${index}] submit error:`, submitError);
+    }
+    console.log(`[${index}] status:`, status);
+  }
+}
+
+const main = async () => {
+  const { results, directoryResults, topResults } = await generateSearchList();
+
+  if (results.length === 0) {
+    console.log("No results to submit");
+    return;
+  }
+
+  await syncPagesIndexSettings();
+  await syncDirectoryIndexSettings();
+  await syncIndex("pages", results);
+  await syncIndex("directory", directoryResults);
 
   await storeR2("searchlist.json", JSON.stringify(topResults), true, false).catch((e) => {
     console.log("Error storing top results search list", e);
   });
-
-  const errorMessage = status?.details?.error?.message;
-  if (errorMessage) {
-    console.log(errorMessage);
-  }
-  console.log(status);
 };
 
-//export default main
-main();
+// Add retry logic to main function
+const executeWithRetry = async () => {
+  let attempts = 0;
+  const maxAttempts = 3;
+
+  const tryMain = async (): Promise<any> => {
+    try {
+      attempts++;
+      console.log(`Attempt ${attempts} of ${maxAttempts}`);
+      await main();
+      console.log("Successfully completed main execution");
+      return true;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error(`Error on attempt ${attempts}:`, errorMessage);
+
+      if (attempts < maxAttempts) {
+        console.log(`Waiting 3 minutes before retry...`, attempts);
+        await sleep(3 * 60 * 1000); // 3 minutes in milliseconds
+        return tryMain();
+      } else {
+        console.error("Maximum retry attempts reached. Giving up.");
+        console.error("Final error message:", errorMessage);
+        if (process.env.UPDATE_SEARCH_WEBHOOK_URL) {
+          console.log(
+            "Notifying via webhook about failure...",
+            `Update Search process failed after ${maxAttempts} attempts. Error: ${errorMessage}`
+          );
+          await sendMessage(
+            `Update Search process failed after ${maxAttempts} attempts. Error: ${errorMessage}`,
+            process.env.UPDATE_SEARCH_WEBHOOK_URL!
+          );
+        }
+        return false;
+      }
+    }
+  };
+
+  return tryMain();
+};
+
+if (require.main === module) {
+  executeWithRetry().then((success) => {
+    if (success) {
+      console.log("Process completed successfully");
+    } else {
+      console.log("Process failed after all retry attempts");
+      process.exit(1);
+    }
+  });
+}
+
+async function fetchJson(url: string, ...rest: any): Promise<any> {
+  const response = await fetch(url, ...rest);
+  try {
+    if (response.ok) {
+      const data = await response.json();
+      return data;
+    }
+
+    // Handle non-200 status codes
+    let errorMessage = `[HTTP] [error] [${response.status}] < ${response.url} >`;
+
+    // Try to get error message from statusText first
+    if (response.statusText) {
+      errorMessage += ` : ${response.statusText}`;
+    }
+
+    // Read response body only once
+    const responseText = await response.text();
+
+    if (responseText) {
+      // Try to parse as JSON first
+      try {
+        const errorResponse = JSON.parse(responseText);
+        if (errorResponse.error) {
+          errorMessage += ` : ${errorResponse.error}`;
+        } else if (errorResponse.message) {
+          errorMessage += ` : ${errorResponse.message}`;
+        } else {
+          // If JSON parsing succeeded but no error/message field, use the text
+          errorMessage += ` : ${responseText}`;
+        }
+      } catch (jsonError) {
+        // If JSON parsing fails, use the text response
+        errorMessage += ` : ${responseText}`;
+      }
+    }
+
+    throw new Error(errorMessage);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    console.log(msg);
+    throw new Error(msg);
+  }
+}

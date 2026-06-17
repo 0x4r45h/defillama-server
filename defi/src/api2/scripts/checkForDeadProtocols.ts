@@ -1,6 +1,6 @@
 import '../utils/failOnError'
 
-import { roundVaules, } from "../utils";
+import { roundValues, } from "../utils";
 import * as sdk from "@defillama/sdk";
 // import { sendMessage } from '../../utils/discord';
 import axios from 'axios';
@@ -86,11 +86,13 @@ async function run() {
 
   const whitelistedSet = new Set([
     'test market',
-    'Rho Markets',
-    'Orbit Protocol',
     'MovePosition',
     'DAOLama',
     'RealT RMM Marketplace V2',
+    'Quantus Lend', // marked as rug pull, latest tvl data was before marked insolvent
+    'Fira', // backed by bUSD0 in 0xa428723eE8ffD87088C36121d72100B43F11fb6A (UZR lending market), but it is excluded from tvl to prevent doublecount with USD0
+    'Milk Finance', // backed by unpriced MILK tokens that are intentionally excluded as it is the team's own token: 0x6E0090dBecF3b4F0F9429637756CaDD8Fc468C54
+    'Credit', // the protocol allows undercollateralized lending
   ])
   const filteredHighBorrowedProtocols = verHighBorrowedProtocols.filter((i: any) => {
     return i.borrowedOrig  > 200_000 && !i.isMarkedDead && i.borrowedDiff > 5 && i.category === 'Lending' && !whitelistedSet.has(i.name)
@@ -125,7 +127,7 @@ const hn = (n: number) => n ? sdk.humanizeNumber(Math.round(n)) : '0'
 run().catch(console.error).then(() => process.exit(0))
 
 function getDiffPercentage(current: number, other: number) {
-  return roundVaules(current * 100 / other - 100)
+  return roundValues(current * 100 / other - 100)
 }
 
 function getAverageOfObject(obj: Record<string, number> = {}) {

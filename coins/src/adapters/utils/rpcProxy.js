@@ -12,4 +12,16 @@ export default {
       return data
     },
   },
+  fuel: {
+    query: async ({ contractId, abi, method, params = [] }) => {
+      const { data } = await client.post('/fuel/query', { contractId, abi, method, params})
+      return data
+    }
+  },
+  stellar: {
+    contractCall: async (contractId, method) => {
+      const { data } = await client.get(`/stellar/contract-call/${contractId}/${method}`)
+      return data
+    },
+  },
 }

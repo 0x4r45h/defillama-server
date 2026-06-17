@@ -1,7 +1,11 @@
 
-import { AdapterType, ProtocolType } from "@defillama/dimension-adapters/adapters/types"
-import { AdaptorRecordType, IJSON, ProtocolAdaptor } from "../data/types"
+import { AdapterType, ProtocolType, AdaptorRecordType, IJSON, ProtocolAdaptor } from "../data/types"
 import { getTimestampString } from "../../api2/utils"
+import { getUnixTimeNow } from "../../api2/utils/time"
+import { humanizeNumber } from "@defillama/sdk"
+import { initializeTVLCacheDB } from "../../api2/db"
+import { Tables } from "../../api2/db/tables"
+import dynamodb from "../../utils/shared/dynamodb"
 
 export function toStartOfDay(unixTimestamp: number) {
   const date = new Date(unixTimestamp * 1e3)
@@ -20,12 +24,18 @@ type DataJSON = {
   aggregated: {
     [key in AdaptorRecordType]?: IRecordAdaptorRecordData
   },
-  breakdown?: {
-    [versionKey: string]: {
-      [key in AdaptorRecordType]?: IRecordAdaptorRecordData
-    }
-  }
 }
+
+type ValidationOptions = {
+  getSignificantValueThreshold: (s: string) => number,
+  getSpikeThreshold?: (s: string) => number,
+  recentData: any,
+  skipDefaultSpikeCheck?: boolean,
+}
+
+const AdapterTypesWithoutChainLevelData = new Set<AdapterType>([
+  AdapterType.NEW_USERS
+])
 
 export class AdapterRecord2 {
   data: DataJSON
@@ -35,9 +45,13 @@ export class AdapterRecord2 {
   protocolType?: ProtocolType
   breakdownByLabel?: IJSON<IJSON<number>>
   breakdownByLabelByChain?: IJSON<IJSON<IJSON<number>>>
+  tokenBreakdown?: any
+  tokenBreakdownByLabel?: any
+  tokenBreakdownByLabelByChain?: any
   id: string
+  name?: string
 
-  constructor({ data, adaptorId, timestamp, adapterType, breakdownByLabel, breakdownByLabelByChain, }: {
+  constructor({ data, adaptorId, timestamp, adapterType, breakdownByLabel, breakdownByLabelByChain, tokenBreakdown, tokenBreakdownByLabel, tokenBreakdownByLabelByChain, name }: {
     data: DataJSON,
     adaptorId: string,
     timestamp: number,
@@ -45,6 +59,10 @@ export class AdapterRecord2 {
     protocolType?: ProtocolType,
     breakdownByLabel?: IJSON<IJSON<number>>
     breakdownByLabelByChain?: IJSON<IJSON<IJSON<number>>>
+    tokenBreakdown?: any
+    tokenBreakdownByLabel?: any
+    tokenBreakdownByLabelByChain?: any
+    name?: string
   }) {
     this.data = data
     this.timeS = getTimestampString(timestamp)
@@ -53,9 +71,13 @@ export class AdapterRecord2 {
     this.id = adaptorId
     this.breakdownByLabel = breakdownByLabel
     this.breakdownByLabelByChain = breakdownByLabelByChain
+    this.tokenBreakdown = tokenBreakdown
+    this.tokenBreakdownByLabel = tokenBreakdownByLabel
+    this.tokenBreakdownByLabelByChain = tokenBreakdownByLabelByChain
+    this.name = name
   }
 
-  static formAdaptarRecord2({ jsonData, protocolType, adapterType, protocol, }: {
+  static formAdaptarRecord2({ jsonData, protocolType, adapterType, protocol, tokenBreakdown, tokenBreakdownByLabel, tokenBreakdownByLabelByChain }: {
     jsonData: {
       timestamp?: number,
       aggregated: IJSON<IRecordAdaptorRecordData>,
@@ -65,6 +87,9 @@ export class AdapterRecord2 {
     protocolType?: ProtocolType,
     adapterType: AdapterType,
     protocol: ProtocolAdaptor,
+    tokenBreakdown?: any
+    tokenBreakdownByLabel?: any
+    tokenBreakdownByLabelByChain?: any
   }): AdapterRecord2 | null {
 
     // clone to be safe 
@@ -85,41 +110,38 @@ export class AdapterRecord2 {
       return null
     }
 
-    return new AdapterRecord2({ data, adaptorId: protocol.id2, adapterType, timestamp: timestamp!, protocolType, breakdownByLabel: jsonData.breakdownByLabel, breakdownByLabelByChain: jsonData.breakdownByLabelByChain })
+    return new AdapterRecord2({ data, adaptorId: protocol.id2, adapterType, timestamp: timestamp!, protocolType, breakdownByLabel: jsonData.breakdownByLabel, breakdownByLabelByChain: jsonData.breakdownByLabelByChain, tokenBreakdown, tokenBreakdownByLabel, tokenBreakdownByLabelByChain, name: protocol.name })
 
 
     function validateRecord(record: any) {
-      const printRecordInfo = () => console.info('invalid chainDataKey', JSON.stringify(record), protocol.id2, protocol.name, protocolType, adapterType)
+      const printRecordInfo = (message: string) => {
+        console.log('invalid chainDataKey: ', message, JSON.stringify(record), protocol.id2, protocol.name, protocolType, adapterType)
+        throw new Error(`Invalid record: ${message}`)
+      }
       if (!record) {
-        printRecordInfo()
-        throw new Error('Invalid record');
+        printRecordInfo('Record is null or undefined')
       }
 
       const { value, chains } = record;
 
       if (typeof value !== 'number' || isNaN(value)) {
-        printRecordInfo()
-        throw new Error('Invalid value in record');
+        printRecordInfo('Invalid value in record')
       }
 
       if (typeof chains !== 'object' || chains === null) {
-        printRecordInfo()
-        throw new Error('Invalid chains in record');
+        printRecordInfo('Invalid chains in record')
       }
 
-      if (Object.keys(chains).length === 0) {
-        printRecordInfo()
-        throw new Error('Chains object is empty');
+      if (Object.keys(chains).length === 0 && !AdapterTypesWithoutChainLevelData.has(adapterType)) {
+        printRecordInfo('Chains object is empty')
       }
 
       for (const [chain, chainValue] of Object.entries(chains)) {
         if (typeof chain !== 'string' || chain.trim() === '') {
-          printRecordInfo()
-          throw new Error('Invalid chain name in chains');
+          printRecordInfo('Invalid chain name in chains')
         }
         if (typeof chainValue !== 'number' || isNaN(chainValue)) {
-          printRecordInfo()
-          throw new Error(`Invalid value for chain ${chain} in chains`);
+          printRecordInfo(`Invalid value for chain ${chain} in chains`)
         }
       }
     }
@@ -138,6 +160,9 @@ export class AdapterRecord2 {
       data: this.data,
       bl: this.breakdownByLabel,
       blc: this.breakdownByLabelByChain,
+      tb: this.tokenBreakdown ?? null,
+      tbl: this.tokenBreakdownByLabel ?? null,
+      tblc: this.tokenBreakdownByLabelByChain ?? null,
     }
   }
 
@@ -160,5 +185,155 @@ export class AdapterRecord2 {
       bl: this.breakdownByLabel,
       blc: this.breakdownByLabelByChain,
     }
+  }
+
+  validateWithRecentData(options: ValidationOptions): any {
+    const spikeError = this.checkSpikes(options)
+    if (spikeError) return spikeError
+    return null
+  }
+
+  checkSpikes(options: ValidationOptions): any {
+    const { recentData, getSpikeThreshold, getSignificantValueThreshold, } = options
+    const aggData: any = this.data.aggregated
+    const isDatapointOlderThanAMonth = (getUnixTimeNow() - this.timestamp) > 31 * 24 * 60 * 60
+    const hasTooFewDatapoints = !recentData || recentData.tooFewRecords
+
+    if (hasTooFewDatapoints) { // we dont have enough data to compare with, do general spike check
+
+      if (options.skipDefaultSpikeCheck) return; // skip the default spike check for this adapter
+
+
+      for (const dataType of Object.keys(aggData)) {
+        if (dataType.startsWith('t')) continue;  // skip accumulative types
+
+        const { value }: { value: number } = aggData[dataType]
+        const triggerValue = getSpikeThreshold!(dataType)
+
+        const absoluteValue = Math.abs(value) //negative spikes should be blocked too
+
+        if (absoluteValue >= triggerValue) {
+          return this.getValidationError({
+            message: `${dataType}: ${humanizeNumber(value)} >= ${humanizeNumber(triggerValue)} (default threshold)`,
+            type: 'spike',
+            metadata: {
+              hasRecentData: recentData,
+              tooFewDataPoints: recentData?.tooFewDataPoints,
+              isDatapointOlderThanAMonth,
+            }
+          })
+        }
+      }
+
+      return;
+    }
+
+
+    // validate using past data
+
+
+    for (const dataType of Object.keys(aggData)) {
+      if (dataType.startsWith('t')) continue;  // skip accumulative types
+
+      const { value }: { value: number } = aggData[dataType]
+      let triggerValue = getSpikeThreshold!(dataType)
+      let minSignificantValue = getSignificantValueThreshold(dataType)
+
+      if (isDatapointOlderThanAMonth) {
+        minSignificantValue *= 5 // for old datapoints, we increase the base level to avoid false positives
+        triggerValue *= 5  // for old datapoints, we increase the spike trigger level to avoid false positives
+      }
+
+      const absoluteValue = Math.abs(value); //negative spikes should be blocked too
+
+      if (absoluteValue < minSignificantValue) continue; // no need to check for spikes if value is below base level
+
+      const monthStats = recentData?.dimStats?.[dataType]?.monthStats ?? {
+        highest: minSignificantValue
+      }
+
+
+      // normally, we call it a spike if it is 5x the highest datapoint in the last month
+      // but if value is higher than baseline spike config (say 10M for dex volume), then we treat 3x a spike
+      let spikeThresholdRatio = 5
+      let currentRatio = absoluteValue / monthStats.highest
+      if (monthStats.highest > triggerValue) spikeThresholdRatio = 3
+
+      if (currentRatio >= spikeThresholdRatio) {
+        return this.getValidationError({
+          message: `${dataType}: ${humanizeNumber(value)} > ${humanizeNumber(monthStats.highest)} (highest) (ratio: ${Number(currentRatio).toFixed(2)}x)`,
+          type: 'spike',
+        })
+      }
+    }
+  }
+
+  checkDrop(options: ValidationOptions): any {
+    const { recentData, } = options
+    const aggData: any = this.data.aggregated
+    const isDatapointOlderThanAMonth = (getUnixTimeNow() - this.timestamp) > 31 * 24 * 60 * 60
+
+
+    // skip the drop check if:
+    //  - recent data is missing
+    //  - too few datapoints
+    //  - it is a small protocol 
+    //  - the datapoint is older than a month
+    const skipCheck = !recentData || recentData.tooFewRecords || !recentData.hasSignificantData ||isDatapointOlderThanAMonth
+
+    if (skipCheck) return;
+
+
+    // validate using past data
+
+
+    for (const dataType of Object.keys(aggData)) {
+      if (dataType.startsWith('t')) continue;  // skip accumulative types
+
+      let { value }: { value: number } = aggData[dataType]
+      const { monthStats, hasSignificantData } = recentData?.dimStats?.[dataType] ?? {}
+      if (!monthStats || !hasSignificantData || !monthStats.lowest || !monthStats.median) continue; // no data to compare with or no significant data for given metric in the past
+
+      if (value < 500) value = 500 // treat small values as 500 to avoid false positives
+      const isDrop = value / monthStats.lowest  < 1/3 // current value is less than 33% of the lowest value in the last month
+
+      if (isDrop) {
+        return this.getValidationError({
+          message: `${dataType}: ${humanizeNumber(value)} < ${humanizeNumber(monthStats.lowest)} (ratio: ${Number(value/monthStats.lowest).toFixed(2)}x)`,
+          type: 'drop',
+        })
+      }
+    }
+  }
+
+  static async deleteFromDB({ adapterType, id, timeS, timestamp, data, bl, blc }: { adapterType: AdapterType, id: string, timeS: string, timestamp?: number, data?: any, bl?: any, blc?: any }) {
+    await initializeTVLCacheDB()
+    await dynamodb.putEventData({
+      PK: `dimension-delete#${adapterType}#${id}`,
+      SK: String(timestamp ?? timeS),
+      source: 'dimension-delete',
+      adapterType,
+      id,
+      timeS,
+      timestamp,
+      data,
+      bl,
+      blc,
+    })
+    await Tables.DIMENSIONS_DATA.destroy({ where: { type: adapterType, id, timeS } })
+  }
+
+  getValidationError(data: { message: string, metadata?: any, type?: string }) {
+    return {
+      ...data,
+      reportTime: getUnixTimeNow() * 1000,  // easier to deal with ms in ES
+      adapterType: this.adapterType,
+      id: this.id,
+      timeS: this.timeS,
+      timestamp: this.timestamp,
+      name: this.name,
+      currentData: JSON.stringify({ data: this.data, blc: this.breakdownByLabelByChain, bl: this.breakdownByLabel }),
+    }
+
   }
 }
